@@ -18,6 +18,7 @@ type gcFakeRepo struct {
 	keys       map[string]struct{}
 	purged     []string
 	purgedKeys int
+	purgedJobs int
 }
 
 func (r *gcFakeRepo) ListDeleted(context.Context, int) ([]*metadata.File, error) {
@@ -34,6 +35,14 @@ func (r *gcFakeRepo) PurgeIdempotencyKeys(_ context.Context, _ time.Time) (int, 
 	r.purgedKeys++
 	return r.purgedKeys, nil
 }
+func (r *gcFakeRepo) PurgeFinishedJobs(_ context.Context, _ time.Time) (int, error) {
+	r.purgedJobs++
+	return r.purgedJobs, nil
+}
+
+// unlimited is the collector configuration the sweep-logic tests share:
+// key expiry and job retention are off, so those counters stay at zero.
+var unlimited = gc.Options{Interval: time.Minute, GracePeriod: time.Hour}
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
@@ -50,7 +59,7 @@ func TestReclaimOrphanPastGraceButNotFresh(t *testing.T) {
 	b.PutAged("fresh-orphan", []byte("y"), time.Now())
 
 	repo := &gcFakeRepo{keys: map[string]struct{}{}} // neither key referenced
-	c := gc.New(b, repo, discardLogger(), time.Minute, time.Hour, 0)
+	c := gc.New(b, repo, discardLogger(), unlimited)
 
 	stats, err := c.RunOnce(ctx)
 	if err != nil {
@@ -73,7 +82,7 @@ func TestReferencedObjectNotReclaimed(t *testing.T) {
 	b.PutAged("live-key", []byte("data"), time.Now().Add(-2*time.Hour))
 
 	repo := &gcFakeRepo{keys: map[string]struct{}{"live-key": {}}}
-	c := gc.New(b, repo, discardLogger(), time.Minute, time.Hour, 0)
+	c := gc.New(b, repo, discardLogger(), unlimited)
 
 	stats, err := c.RunOnce(ctx)
 	if err != nil {
@@ -93,7 +102,7 @@ func TestPurgeSoftDeleted(t *testing.T) {
 		deleted: []*metadata.File{{ID: "id-1", StorageKey: "obj-1"}},
 		keys:    map[string]struct{}{"obj-1": {}}, // still referenced until purged
 	}
-	c := gc.New(b, repo, discardLogger(), time.Minute, time.Hour, 0)
+	c := gc.New(b, repo, discardLogger(), unlimited)
 
 	stats, err := c.RunOnce(ctx)
 	if err != nil {
@@ -115,7 +124,7 @@ func TestExpireIdempotencyKeys(t *testing.T) {
 	repo := &gcFakeRepo{keys: map[string]struct{}{}}
 
 	// Disabled when TTL <= 0.
-	c := gc.New(memory.New(), repo, discardLogger(), time.Minute, time.Hour, 0)
+	c := gc.New(memory.New(), repo, discardLogger(), unlimited)
 	if _, err := c.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -124,12 +133,35 @@ func TestExpireIdempotencyKeys(t *testing.T) {
 	}
 
 	// Enabled when TTL > 0.
-	c = gc.New(memory.New(), repo, discardLogger(), time.Minute, time.Hour, 24*time.Hour)
+	c = gc.New(memory.New(), repo, discardLogger(), gc.Options{Interval: time.Minute, GracePeriod: time.Hour, IdempotencyTTL: 24 * time.Hour})
 	stats, err := c.RunOnce(ctx)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if stats.ExpiredKeys != 1 {
 		t.Fatalf("expected ExpiredKeys reported, got %d", stats.ExpiredKeys)
+	}
+}
+
+func TestExpireFinishedJobs(t *testing.T) {
+	ctx := context.Background()
+	repo := &gcFakeRepo{keys: map[string]struct{}{}}
+
+	// Retention <= 0 disables the purge, like key expiry.
+	c := gc.New(memory.New(), repo, discardLogger(), unlimited)
+	if _, err := c.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if repo.purgedJobs != 0 {
+		t.Fatalf("retention<=0 should not purge jobs, got %d calls", repo.purgedJobs)
+	}
+
+	c = gc.New(memory.New(), repo, discardLogger(), gc.Options{Interval: time.Minute, GracePeriod: time.Hour, JobRetention: 24 * time.Hour})
+	stats, err := c.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.ExpiredJobs != 1 {
+		t.Fatalf("expected ExpiredJobs reported, got %d", stats.ExpiredJobs)
 	}
 }

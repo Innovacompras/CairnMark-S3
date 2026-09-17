@@ -29,11 +29,16 @@ behind your own gateway).
 - **Idempotent uploads** — an optional `Idempotency-Key` header makes retried
   uploads safe: a retry replays the original result instead of duplicating, with
   a crash-safe atomic commit.
+- **Archive extraction** — upload a `.zip`, list what is inside, and store the
+  entries you pick as ordinary, searchable files linked back to the archive.
+  Runs as a job you poll or cancel; hard-capped, resumable, and safe across
+  replicas.
 - **One backend, many stores** — the storage layer speaks plain S3. RustFS,
   SeaweedFS, and MinIO each ship as a ready-to-run Compose setup; AWS S3 or any
   other S3-compatible store needs only config changes.
-- **Prometheus metrics** — per-route request counts and latency plus GC
-  reclamation counters, exposed at `/metrics`.
+- **Prometheus metrics** — per-route request counts and latency, GC
+  reclamation counters, and extraction-job outcomes, durations and queue
+  depth, exposed at `/metrics`.
 
 ## Quickstart
 
@@ -129,10 +134,18 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `CAIRNMARK_HTTP_ADDR` | `:8080` | HTTP listen address |
 | `CAIRNMARK_SHUTDOWN_TIMEOUT` | `10s` | Graceful shutdown grace period |
 | `CAIRNMARK_PRESIGN_TTL` | `15m` | Lifetime of presigned download URLs |
-| `CAIRNMARK_MAX_UPLOAD_BYTES` | `0` (uncapped) | Max upload body size in bytes; larger uploads get `413` |
+| `CAIRNMARK_MAX_UPLOAD_BYTES` | `0` (uncapped) | Max upload body size in bytes; larger uploads get `413`. Also caps each entry extracted from an archive |
 | `CAIRNMARK_GC_INTERVAL` | `5m` | Reconciliation sweep cadence (`<=0` disables GC — and all the cleanup below) |
 | `CAIRNMARK_GC_GRACE_PERIOD` | `1h` | Min age before an unreferenced object is reclaimed; **must exceed your longest upload** |
 | `CAIRNMARK_IDEMPOTENCY_TTL` | `24h` | How long upload idempotency keys are kept before the GC sweep expires them (`<=0` disables expiry) |
+| `CAIRNMARK_ARCHIVE_MAX_ENTRIES` | `1000` | Max entries in a zip the archive endpoints will open; larger archives get `413` (`0` = the 10,000-entry ceiling below, not unbounded) |
+| `CAIRNMARK_ARCHIVE_MAX_TOTAL_BYTES` | `1073741824` (1 GiB) | Max uncompressed bytes one extraction may write; a larger selection gets `413` (`0` = uncapped) |
+| `CAIRNMARK_ARCHIVE_MAX_RATIO` | `100` | Per-entry uncompressed÷compressed ratio above which an entry is skipped as a zip bomb (`0` = uncapped). Deflate reaches ~1032:1, so the default also skips genuinely repetitive documents — a CSV of repeated values, a log, an XML export; raise it if that is your corpus |
+| `CAIRNMARK_ARCHIVE_EXTENSIONS` | — *(all)* | Comma-separated allowlist of extensions to extract, e.g. `pdf,docx`; other entries are skipped |
+| `CAIRNMARK_ARCHIVE_MAX_DIRECTORY_BYTES` | `0` *(derived)* | Bytes the zip's central directory may span; larger archives get `413` **before** the directory is parsed, which is the only bound that can precede the allocation. `0` does not disable it — it derives the bound from `CAIRNMARK_ARCHIVE_MAX_ENTRIES` (512 bytes per entry), which is right unless your paths are extremely long |
+| `CAIRNMARK_JOB_CONCURRENCY` | `1` | Extraction jobs one replica runs at once. `1` on purpose: extraction is IO-bound on the store, two workers never share one archive anyway, and each in-flight run pins a read window plus a multipart part of memory. Raise it with evidence; must be `>= 1` |
+| `CAIRNMARK_JOB_HEARTBEAT_TTL` | `5m` | How long a running job may go without a heartbeat before its worker is presumed dead and the job is returned to the queue. Too long and a crashed job blocks its archive for that long; too short and a healthy run is stolen mid-flight. Must be `> 0`; `0` is refused rather than meaning "disabled" |
+| `CAIRNMARK_JOB_RETENTION` | `24h` | How long a finished job stays readable at `GET /jobs/{id}` before the GC sweep deletes it (`<=0` disables the sweep). After that the job is `404`; the extracted files are permanent |
 | `CAIRNMARK_POSTGRES_DSN` | — *(required)* | pgx connection string |
 | `CAIRNMARK_S3_ENDPOINT` | — *(required)* | Object store host:port for service I/O (no scheme) |
 | `CAIRNMARK_S3_PUBLIC_ENDPOINT` | = endpoint | Host baked into presigned URLs (see note below) |
@@ -162,7 +175,11 @@ rewritten afterward).
 | `GET` | `/files/{id}/metadata` | Metadata as JSON. |
 | `PATCH` | `/files/{id}/metadata` | Merge tags (or `?mode=replace`). Body is a JSON object. |
 | `DELETE` | `/files/{id}` | Soft delete (`204`). Object purged asynchronously. |
-| `GET` | `/files` | List/search: `?content_type=`, `?tag.<k>=<v>`, `?limit=`, `?cursor=`. |
+| `GET` | `/files/{id}/archive` | List a zip's entries — index, size, content type, and whether each is extractable (and why not). Writes nothing. |
+| `POST` | `/files/{id}/extract` | Submit an extraction job: store a zip's entries as files. Optional body `{"entries":[0,4]}` selects by index. Returns `202` + the job, `Location: /jobs/{id}`. |
+| `GET` | `/jobs/{id}` | An extraction job's state: status, progress, and the bounded summary once it is done. |
+| `POST` | `/jobs/{id}/cancel` | Ask a job to stop after the entry it is on (`202`). Idempotent; a finished job is returned unchanged. |
+| `GET` | `/files` | List/search: `?content_type=`, `?tag.<k>=<v>`, `?entries=include\|exclude\|only`, `?limit=`, `?cursor=`. |
 | `GET` | `/healthz` · `/readyz` | Liveness / readiness. |
 | `GET` | `/metrics` | Prometheus exposition. |
 
@@ -209,6 +226,137 @@ back as `?cursor=` to fetch the files older than it. A page without
 `next_cursor` is the last one. Cursors stay accurate under concurrent
 uploads/deletes and don't slow down on deep pages the way `OFFSET` does.
 
+### Archives (`.zip`)
+
+An archive uploads like any other file. Extraction is a second, explicit call
+against the stored object, so nothing is unpacked until you ask:
+
+```sh
+# 1. Upload the zip
+curl -s -H "Content-Type: application/zip" --data-binary @docs.zip \
+  "http://localhost:8080/files?filename=docs.zip"            # note the "id" → <archive-id>
+
+# 2. See what is inside — nothing is written
+curl -s "http://localhost:8080/files/<archive-id>/archive"
+
+# 3. Submit an extraction of every extractable entry (or a selection:
+#    -d '{"entries":[0,4]}'). 202: the run happens on the server's worker.
+curl -s -X POST "http://localhost:8080/files/<archive-id>/extract"   # note the job "id" → <job-id>
+
+# 4. Poll the job until its status is succeeded, failed or cancelled
+curl -s "http://localhost:8080/jobs/<job-id>"
+#    (changed your mind? POST /jobs/<job-id>/cancel stops it after the current entry)
+
+# 5. Find the extracted documents, and download one
+curl -s "http://localhost:8080/files?tag.cm:archive_id=<archive-id>"
+curl -s "http://localhost:8080/files?tag.cm:archive_id=<archive-id>&tag.cm:archive_path=reports/q3.pdf"
+curl -L "http://localhost:8080/files/<entry-id>" -o q3.pdf
+```
+
+The listing names each entry by its **index** in the archive's directory —
+names need not be unique inside a zip, indexes are — and says whether it is
+extractable and, if not, why:
+
+```jsonc
+// GET /files/{id}/archive → 200
+{ "archive_id": "…", "entries": [
+  { "index": 0, "name": "reports/q3.pdf", "size": 184322,
+    "content_type": "application/pdf", "crc32": "8f2a91c4", "selectable": true },
+  { "index": 1, "name": "__MACOSX/reports/._q3.pdf", "size": 220,
+    "crc32": "d1c0b3aa", "selectable": false, "reason": "platform_metadata" }
+] }
+
+// POST /files/{id}/extract → 202 — the job, with Location: /jobs/{id}
+{ "id": "…", "archive_id": "…", "status": "pending",
+  "progress": { "done": 0, "total": 0 }, "cancel_requested": false,
+  "summary": null, "created_at": "…", "updated_at": "…", "finished_at": null }
+
+// GET /jobs/{id} → 200 — once terminal, the bounded summary; never the list of results
+{ "id": "…", "archive_id": "…", "status": "succeeded",
+  "progress": { "done": 118, "total": 118 }, "cancel_requested": false,
+  "summary": { "archive_id": "…", "entries": 132, "extracted": 118, "skipped": 14,
+               "skipped_by_reason": { "platform_metadata": 12, "encrypted": 2 },
+               "sample_skipped": [ { "index": 7, "name": "…", "reason": "encrypted" } ] },
+  "created_at": "…", "updated_at": "…", "finished_at": "…" }
+```
+
+A job is `pending`, then `running`, then `succeeded`, `failed` (with an
+`error`) or `cancelled`; only those last three are final. A running job can
+go back to `pending` if its worker shuts down or stops reporting — it is
+picked up again and resumes — so poll until a final state, not until the job
+leaves `running`. `progress` counts the entries the current run intends to
+write, not the archive's entry count, and a resumed run counts only what
+remained. A job id is a bearer capability, exactly as a file id is: there is
+no listing, and whoever holds the id can poll and cancel it.
+
+Each extracted entry becomes an ordinary file — its own id, SHA-256, and
+content type (from the entry's extension, sniffed otherwise) — carrying three
+service-written tags: `cm:archive_id`, `cm:archive_path` (the full path inside
+the archive) and `cm:archive_index`. The archive row itself is stamped
+`cm:archive=true`. The `cm:` prefix is **reserved**: an upload or `PATCH` that
+tries to write it gets `400`, and a `PATCH ?mode=replace` on an extracted file
+leaves its `cm:` tags in place.
+
+Skip reasons: `directory`, `non_regular`, `platform_metadata` (`__MACOSX/`,
+`._*`, `.DS_Store`, `Thumbs.db`), `encrypted`, `unsupported_method` (anything
+but Store or Deflate — Deflate64, bzip2, LZMA, zstd and AES all occur in the
+wild, and skip the entry rather than fail the archive), `unsafe_name`,
+`too_large`, `ratio_exceeded`, `extension_not_allowed`, `corrupt` (the entry
+failed its own CRC32), `not_selected`, `already_extracted` and
+`previously_deleted`. Zero-byte entries are kept: an empty file is a
+legitimate file.
+
+Extraction is **resumable by construction**: a re-run skips every entry that
+already has a live file (`already_extracted`), so a job that failed, was
+cancelled, or was interrupted by a restart is simply submitted again and
+completes the remainder. An extracted file you deleted stays deleted
+(`previously_deleted`) for as long as its tombstone exists — until the GC
+sweep purges it — so delete wins over re-extract. One archive has at most one
+job pending or running at a time: a second submission gets `409` with a
+`Retry-After` and, in the body, the `job_id` of the active job — the thing to
+poll. `Idempotency-Key` is refused on this endpoint (`400`): the job id is
+the idempotency handle, and a re-submission resumes.
+
+Cancelling is cooperative: the worker finishes the entry it is writing, then
+stops and reports `cancelled` with the partial summary. Nothing already
+written is undone; submit again and it continues. A worker that dies leaves
+its job `running` with a heartbeat that ages; once it is older than
+`CAIRNMARK_JOB_HEARTBEAT_TTL` (default 5m) the job goes back to the queue and
+the next pickup resumes it — on any replica, with no coordination beyond the
+database. A clean shutdown parks a running job the same way, immediately.
+Finished jobs are readable for `CAIRNMARK_JOB_RETENTION` (default 24h), after
+which `GET /jobs/{id}` is `404`; a client that polls slower than that loses
+the summary, though the extracted files themselves are permanent.
+
+What the submission itself can refuse, it refuses at once, with the same
+statuses a synchronous call gave: not a zip (`415`), a selection out of range
+(`400`), over a cap (`413`), unknown (`404`). A job only fails on what could
+not be known up front — the store or the database failing mid-run.
+
+After an extraction, `GET /files` returns ordinary files, archives and
+extracted entries together. `?entries=exclude` hides the extracted entries,
+`?entries=only` shows just them, and `?tag.cm:archive=true` lists the archives.
+
+Other statuses: `415` when the file is not a zip (both endpoints); `413` when
+the archive has more entries than `CAIRNMARK_ARCHIVE_MAX_ENTRIES` or the
+selection would write more than `CAIRNMARK_ARCHIVE_MAX_TOTAL_BYTES`. The entry
+count is also capped at 10,000 regardless of configuration: the listing is a
+single unpaginated response, so `CAIRNMARK_ARCHIVE_MAX_ENTRIES=0` raises the
+cap to that ceiling rather than removing it. A `413` also comes from
+`CAIRNMARK_ARCHIVE_MAX_DIRECTORY_BYTES`, refused before the central directory is
+parsed — the entry count cannot be checked any earlier, since it does not exist
+until the parse is done. Each
+extracted entry is an upload, so `CAIRNMARK_MAX_UPLOAD_BYTES` caps it too. Only
+`.zip` is supported — RAR, 7z, tar and nested archives are not.
+
+The SDKs wrap all of it: `ArchiveEntries` / `Extract` in Go, `archiveEntries`
+/ `extract` in Node, `archive_entries` / `extract` in Python — where `Extract`
+submits, polls and returns the summary, so a caller that does not care that
+the server is asynchronous never sees it — plus the job surface
+(`ExtractAsync`, `Job`, `WaitForJob`, `CancelJob` and their equivalents), the
+`entries` list scope and constants for the `cm:` tag keys. The contract they
+follow is [`docs/sdk-contract.md`](docs/sdk-contract.md).
+
 ## Official SDKs
 
 Hand-written clients for three languages, all exposing the same surface:
@@ -216,7 +364,9 @@ streaming uploads/downloads, typed errors, safe retries with idempotency
 keys, lazy pagination, and client-side checksum verification (the piece raw
 HTTP can't give you — presigned downloads bypass the service, so only the
 client can compare the stored SHA-256). Each SDK's README is a complete
-integration guide; all require server ≥ v1.1.0.
+integration guide. SDK v1.0.0 requires this server release or later (the
+archive and job methods need the `extraction_jobs` migration); everything
+else in them works against ≥ v1.1.0.
 
 | Language | Repo | Install |
 |---|---|---|
@@ -333,6 +483,7 @@ Dependencies point inward; the HTTP layer never touches storage directly.
 cmd/server        composition root (DI) — the only place concretes are built
 internal/api      HTTP handlers + routing (stdlib net/http)
 internal/files    service layer: orchestrates storage + metadata, owns the write path
+internal/archive  zip walking over an io.ReaderAt: entries, skip rules, per-entry content
 internal/storage  Backend interface  ──  storage/s3 (S3 client, the only backend)
 internal/metadata Repository interface ── metadata/postgres (pgx; the only SQL)
 internal/gc       background reconciliation: purge soft-deletes, reclaim orphans

@@ -48,14 +48,17 @@ func scanFile(r row) (*metadata.File, error) {
 	return &f, nil
 }
 
-// List returns live records matching the filter, newest first, filtered by
-// content type and/or JSONB tag containment, with keyset pagination. Ordering
-// is by id descending — ids are UUIDv7, so id order is creation order and the
+// List returns records matching the filter, newest first — live ones unless
+// the filter asks for tombstones too — filtered by content type, JSONB tag
+// containment and the extracted-entry scope, with keyset pagination. Ordering
+// is by id descending: ids are UUIDv7, so id order is creation order and the
 // primary-key index serves both the sort and the cursor bound.
 func (r *Repo) List(ctx context.Context, filter metadata.ListFilter) ([]*metadata.File, error) {
 	var conds []string
 	var args []any
-	conds = append(conds, "deleted_at is null")
+	if !filter.IncludeDeleted {
+		conds = append(conds, "deleted_at is null")
+	}
 
 	if filter.ContentType != "" {
 		args = append(args, filter.ContentType)
@@ -78,6 +81,20 @@ func (r *Repo) List(ctx context.Context, filter metadata.ListFilter) ([]*metadat
 		conds = append(conds, fmt.Sprintf("metadata @> $%d::jsonb", len(args)))
 	}
 
+	// Presence (?) of the archive-id key is what makes a row an extracted
+	// entry. `only` is served by the GIN index; `exclude` is a negation and
+	// therefore a filter, not an index seek — fine at this project's scale,
+	// and a partial index is the additive upgrade if it ever shows up in slow
+	// queries.
+	switch filter.Entries {
+	case metadata.EntriesOnly:
+		args = append(args, metadata.TagArchiveID)
+		conds = append(conds, fmt.Sprintf("metadata ? $%d", len(args)))
+	case metadata.EntriesExclude:
+		args = append(args, metadata.TagArchiveID)
+		conds = append(conds, fmt.Sprintf("not (metadata ? $%d)", len(args)))
+	}
+
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = listDefaultLimit
@@ -88,8 +105,11 @@ func (r *Repo) List(ctx context.Context, filter metadata.ListFilter) ([]*metadat
 	args = append(args, limit)
 	limitClause := fmt.Sprintf(" limit $%d", len(args))
 
-	q := selectColumns + " from files where " + strings.Join(conds, " and ") +
-		" order by id desc" + limitClause
+	where := ""
+	if len(conds) > 0 {
+		where = " where " + strings.Join(conds, " and ")
+	}
+	q := selectColumns + " from files" + where + " order by id desc" + limitClause
 
 	rows, err := r.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -112,19 +132,28 @@ func (r *Repo) List(ctx context.Context, filter metadata.ListFilter) ([]*metadat
 }
 
 // UpdateMetadata writes tags into the record's JSONB column: merged (||) when
-// merge is true, replaced (=) otherwise.
+// merge is true, replaced otherwise.
 func (r *Repo) UpdateMetadata(ctx context.Context, id string, tags map[string]any, merge bool) (*metadata.File, error) {
 	patch, err := json.Marshal(tags)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: marshal tags: %w", err)
 	}
-	assignment := "metadata = $2::jsonb"
-	if merge {
-		assignment = "metadata = metadata || $2::jsonb"
+	args := []any{id, string(patch)}
+	assignment := "metadata = metadata || $2::jsonb"
+	if !merge {
+		// A replace rewrites the whole column, which would silently strip the
+		// service-owned cm:* keys and orphan an extracted entry from its
+		// archive. Rejecting reserved keys at the api layer cannot prevent
+		// that — the client never names them — so they are carried across
+		// here, in the only place that issues SQL.
+		assignment = `metadata = coalesce(
+			(select jsonb_object_agg(key, value) from jsonb_each(metadata) where key like $3),
+			'{}'::jsonb) || $2::jsonb`
+		args = append(args, metadata.ReservedTagPrefix+"%")
 	}
 	q := `update files set ` + assignment + `, updated_at = now()
 		where id = $1 and deleted_at is null returning ` + fileColumns
-	f, err := scanFile(r.pool.QueryRow(ctx, q, id, string(patch)))
+	f, err := scanFile(r.pool.QueryRow(ctx, q, args...))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, metadata.ErrNotFound
 	}

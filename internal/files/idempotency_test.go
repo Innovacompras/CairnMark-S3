@@ -7,12 +7,13 @@ import (
 	"testing"
 
 	"github.com/mettjs/cairnmark/internal/files"
+	metamem "github.com/mettjs/cairnmark/internal/metadata/memory"
 	"github.com/mettjs/cairnmark/internal/storage/memory"
 )
 
 func TestUploadIdempotentReplaysSameFile(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 	body := func() *bytes.Reader { return bytes.NewReader([]byte("payload")) }
 
 	first, replayed, err := svc.UploadIdempotent(ctx, "key-1",
@@ -39,7 +40,7 @@ func TestUploadIdempotentReplaysSameFile(t *testing.T) {
 
 func TestUploadIdempotentInProgressConflicts(t *testing.T) {
 	ctx := context.Background()
-	repo := newFakeRepo()
+	repo := metamem.New()
 	svc := files.New(memory.New(), repo)
 
 	// Simulate another request that has claimed the key but not completed.
@@ -56,7 +57,7 @@ func TestUploadIdempotentInProgressConflicts(t *testing.T) {
 
 func TestUploadIdempotentDeletedResultIsGone(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 
 	first, _, err := svc.UploadIdempotent(ctx, "key-gone",
 		files.UploadInput{Size: 7, Body: bytes.NewReader([]byte("payload"))})
@@ -76,8 +77,8 @@ func TestUploadIdempotentDeletedResultIsGone(t *testing.T) {
 
 func TestUploadIdempotentReleasesOnFailure(t *testing.T) {
 	ctx := context.Background()
-	repo := newFakeRepo()
-	repo.failOnCreate = true // force the upload's metadata commit to fail
+	repo := metamem.New()
+	repo.FailCreate = true // force the upload's metadata commit to fail
 	svc := files.New(memory.New(), repo)
 
 	if _, _, err := svc.UploadIdempotent(ctx, "retry-me",

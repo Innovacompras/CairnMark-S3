@@ -7,114 +7,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sort"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/mettjs/cairnmark/internal/files"
-	"github.com/mettjs/cairnmark/internal/metadata"
+	metamem "github.com/mettjs/cairnmark/internal/metadata/memory"
 	"github.com/mettjs/cairnmark/internal/storage/memory"
 )
 
-// stubRepo is a minimal in-memory metadata.Repository for handler tests. List
-// honors Cursor/Limit by lexicographic id order, which for the UUIDv7 ids the
-// service generates is creation order — the same contract as Postgres.
-type stubRepo struct {
-	mu    sync.Mutex
-	files map[string]*metadata.File
-	idem  map[string]*metadata.IdempotencyRecord
-}
-
-func newStubRepo() *stubRepo {
-	return &stubRepo{files: map[string]*metadata.File{}, idem: map[string]*metadata.IdempotencyRecord{}}
-}
-
-func (r *stubRepo) Create(_ context.Context, f *metadata.File) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	cp := *f
-	r.files[f.ID] = &cp
-	return nil
-}
-
-func (r *stubRepo) Get(_ context.Context, id string) (*metadata.File, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	f, ok := r.files[id]
-	if !ok {
-		return nil, metadata.ErrNotFound
-	}
-	cp := *f
-	return &cp, nil
-}
-
-func (r *stubRepo) List(_ context.Context, filter metadata.ListFilter) ([]*metadata.File, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ids := make([]string, 0, len(r.files))
-	for id := range r.files {
-		ids = append(ids, id)
-	}
-	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
-	var out []*metadata.File
-	for _, id := range ids {
-		if filter.Cursor != "" && id >= filter.Cursor {
-			continue
-		}
-		cp := *r.files[id]
-		out = append(out, &cp)
-		if filter.Limit > 0 && len(out) == filter.Limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-func (r *stubRepo) UpdateMetadata(context.Context, string, map[string]any, bool) (*metadata.File, error) {
-	return nil, metadata.ErrNotFound
-}
-func (r *stubRepo) Delete(context.Context, string) error                       { return metadata.ErrNotFound }
-func (r *stubRepo) ListDeleted(context.Context, int) ([]*metadata.File, error) { return nil, nil }
-func (r *stubRepo) Purge(context.Context, string) error                        { return nil }
-func (r *stubRepo) StorageKeys(context.Context) (map[string]struct{}, error) {
-	return map[string]struct{}{}, nil
-}
-
-func (r *stubRepo) ClaimIdempotencyKey(_ context.Context, key string) (bool, *metadata.IdempotencyRecord, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if rec, ok := r.idem[key]; ok {
-		cp := *rec
-		return false, &cp, nil
-	}
-	r.idem[key] = &metadata.IdempotencyRecord{Status: metadata.IdempotencyPending}
-	return true, nil, nil
-}
-
-func (r *stubRepo) CreateForKey(ctx context.Context, f *metadata.File, key string) error {
-	if err := r.Create(ctx, f); err != nil {
-		return err
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	id := f.ID
-	r.idem[key] = &metadata.IdempotencyRecord{Status: metadata.IdempotencyCompleted, FileID: &id}
-	return nil
-}
-
-func (r *stubRepo) ReleaseIdempotencyKey(_ context.Context, key string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.idem, key)
-	return nil
-}
-
-func (r *stubRepo) PurgeIdempotencyKeys(context.Context, time.Time) (int, error) { return 0, nil }
-
-func newTestRouter(maxUpload int64) (http.Handler, *stubRepo) {
-	repo := newStubRepo()
+func newTestRouter(maxUpload int64) (http.Handler, *metamem.Repo) {
+	repo := metamem.New()
 	h := Router(Deps{
 		Files:          files.New(memory.New(), repo),
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -164,7 +66,9 @@ func TestUploadSizeLimit(t *testing.T) {
 
 func TestIdempotencyConflictSetsRetryAfter(t *testing.T) {
 	h, repo := newTestRouter(0)
-	repo.idem["in-flight"] = &metadata.IdempotencyRecord{Status: metadata.IdempotencyPending}
+	if _, _, err := repo.ClaimIdempotencyKey(context.Background(), "in-flight"); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest("POST", "/files", strings.NewReader("abc"))
 	req.Header.Set("Idempotency-Key", "in-flight")

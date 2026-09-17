@@ -115,7 +115,7 @@ func TestReclaimOrphanAgainstRealStore(t *testing.T) {
 	t.Cleanup(func() { _ = store.Delete(ctx, orphan) })
 
 	repo := &gcFakeRepo{keys: protected} // everything but the orphan is referenced
-	c := gc.New(store, repo, discardLogger(), time.Minute, reclaimEverythingGrace, 0)
+	c := gc.New(store, repo, discardLogger(), gc.Options{Interval: time.Minute, GracePeriod: reclaimEverythingGrace})
 
 	stats, err := c.RunOnce(ctx)
 	if err != nil {
@@ -156,7 +156,7 @@ func TestFreshOrphanSurvivesGrace(t *testing.T) {
 	// Unreferenced, exactly like an upload mid-commit — the grace period is the
 	// only thing standing between it and deletion.
 	repo := &gcFakeRepo{keys: protected}
-	c := gc.New(store, repo, discardLogger(), time.Minute, realisticGrace, 0)
+	c := gc.New(store, repo, discardLogger(), gc.Options{Interval: time.Minute, GracePeriod: realisticGrace})
 
 	stats, err := c.RunOnce(ctx)
 	if err != nil {
@@ -191,7 +191,7 @@ func TestPurgeDeletedAgainstRealStore(t *testing.T) {
 		keys:    protected,
 		deleted: []*metadata.File{{ID: id, StorageKey: key}},
 	}
-	c := gc.New(store, repo, discardLogger(), time.Minute, reclaimEverythingGrace, 0)
+	c := gc.New(store, repo, discardLogger(), gc.Options{Interval: time.Minute, GracePeriod: reclaimEverythingGrace})
 
 	stats, err := c.RunOnce(ctx)
 	if err != nil {

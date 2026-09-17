@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/mettjs/cairnmark/internal/files"
+	metamem "github.com/mettjs/cairnmark/internal/metadata/memory"
 	"github.com/mettjs/cairnmark/internal/storage/memory"
 )
 
@@ -22,7 +23,7 @@ func uploadWithTags(t *testing.T, svc *files.Service, tags map[string]any) *file
 
 func TestUpdateMetadataMerge(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 	f := uploadWithTags(t, svc, map[string]any{"env": "prod"})
 
 	got, err := svc.UpdateMetadata(ctx, f.ID, map[string]any{"team": "search"}, true)
@@ -36,7 +37,7 @@ func TestUpdateMetadataMerge(t *testing.T) {
 
 func TestUpdateMetadataReplace(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 	f := uploadWithTags(t, svc, map[string]any{"env": "prod", "team": "search"})
 
 	got, err := svc.UpdateMetadata(ctx, f.ID, map[string]any{"env": "staging"}, false)
@@ -53,7 +54,7 @@ func TestUpdateMetadataReplace(t *testing.T) {
 
 func TestUpdateMetadataInvalidAndMissing(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 
 	if _, err := svc.UpdateMetadata(ctx, "bad-id", nil, true); err != files.ErrInvalidID {
 		t.Fatalf("expected ErrInvalidID, got %v", err)

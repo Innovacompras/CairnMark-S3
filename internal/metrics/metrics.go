@@ -34,8 +34,29 @@ var (
 
 	gcReclaimed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cairnmark_gc_reclaimed_total",
-		Help: "Items reclaimed by GC, by kind (purged | orphans | expired_keys).",
+		Help: "Items reclaimed by GC, by kind (purged | orphans | expired_keys | expired_jobs).",
 	}, []string{"kind"})
+
+	jobRuns = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cairnmark_extraction_job_runs_total",
+		Help: "Extraction job runs, by resting state (succeeded | failed | cancelled | pending — parked on shutdown or lost to a reaper, to be resumed).",
+	}, []string{"status"})
+
+	jobDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "cairnmark_extraction_job_duration_seconds",
+		Help:    "Wall time of one extraction job run, from claim to its resting state.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 12), // 1s … ~34min
+	})
+
+	jobsPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cairnmark_extraction_jobs_pending",
+		Help: "Extraction jobs waiting for a worker, sampled on the worker's ticker.",
+	})
+
+	jobsReaped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cairnmark_extraction_jobs_reaped_total",
+		Help: "Running extraction jobs returned to the queue because their worker stopped reporting. A non-zero rate means workers are dying or CAIRNMARK_JOB_HEARTBEAT_TTL is too tight — it is the only signal of either.",
+	})
 )
 
 // Handler serves the Prometheus exposition endpoint (GET /metrics).
@@ -50,7 +71,7 @@ func ObserveRequest(method, pattern string, status int, elapsed time.Duration) {
 }
 
 // ObserveGCSweep records the outcome of one reconciliation sweep.
-func ObserveGCSweep(purged, orphans, expiredKeys int, err error) {
+func ObserveGCSweep(purged, orphans, expiredKeys, expiredJobs int, err error) {
 	if err != nil {
 		gcSweeps.WithLabelValues("error").Inc()
 		return
@@ -59,4 +80,21 @@ func ObserveGCSweep(purged, orphans, expiredKeys int, err error) {
 	gcReclaimed.WithLabelValues("purged").Add(float64(purged))
 	gcReclaimed.WithLabelValues("orphans").Add(float64(orphans))
 	gcReclaimed.WithLabelValues("expired_keys").Add(float64(expiredKeys))
+	gcReclaimed.WithLabelValues("expired_jobs").Add(float64(expiredJobs))
+}
+
+// ObserveJobRun records one extraction job run reaching a resting state.
+func ObserveJobRun(status string, elapsed time.Duration) {
+	jobRuns.WithLabelValues(status).Inc()
+	jobDuration.Observe(elapsed.Seconds())
+}
+
+// ObserveJobSweep records one reaper pass: stranded jobs returned to the
+// queue, and the queue depth it saw.
+func ObserveJobSweep(reaped, pending int, err error) {
+	if err != nil {
+		return
+	}
+	jobsReaped.Add(float64(reaped))
+	jobsPending.Set(float64(pending))
 }

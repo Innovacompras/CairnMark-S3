@@ -20,6 +20,9 @@ func registerFiles(mux *http.ServeMux, svc *files.Service, logger *slog.Logger, 
 	mux.HandleFunc("GET /files/{id}/metadata", h.metadata)
 	mux.HandleFunc("PATCH /files/{id}/metadata", h.patchMetadata)
 	mux.HandleFunc("DELETE /files/{id}", h.delete)
+	mux.HandleFunc("GET /files/{id}/archive", h.archiveEntries)
+	mux.HandleFunc("POST /files/{id}/extract", h.extract)
+	registerJobs(mux, h)
 }
 
 type fileHandler struct {

@@ -10,12 +10,13 @@ import (
 	"testing"
 
 	"github.com/mettjs/cairnmark/internal/files"
+	metamem "github.com/mettjs/cairnmark/internal/metadata/memory"
 	"github.com/mettjs/cairnmark/internal/storage/memory"
 )
 
 func TestUploadComputesChecksum(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 	body := []byte("integrity matters")
 	sum := sha256.Sum256(body)
 	want := hex.EncodeToString(sum[:])
@@ -35,7 +36,7 @@ func TestUploadComputesChecksum(t *testing.T) {
 
 func TestUploadSniffsContentType(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 	// Minimal PNG signature → http.DetectContentType reports image/png.
 	body := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 32)...)
 
@@ -51,7 +52,7 @@ func TestUploadSniffsContentType(t *testing.T) {
 func TestChecksumMismatchDetectedOnRead(t *testing.T) {
 	ctx := context.Background()
 	backend := memory.New()
-	svc := files.New(backend, newFakeRepo())
+	svc := files.New(backend, metamem.New())
 
 	f, err := svc.Upload(ctx, files.UploadInput{
 		Size: 5, Body: bytes.NewReader([]byte("hello")),
@@ -77,7 +78,7 @@ func TestChecksumMismatchDetectedOnRead(t *testing.T) {
 
 func TestOpenRangeReturnsPartialBytes(t *testing.T) {
 	ctx := context.Background()
-	svc := files.New(memory.New(), newFakeRepo())
+	svc := files.New(memory.New(), metamem.New())
 	body := []byte("0123456789")
 
 	f, err := svc.Upload(ctx, files.UploadInput{Size: int64(len(body)), Body: bytes.NewReader(body)})

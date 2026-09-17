@@ -18,6 +18,34 @@ const (
 	IdempotencyCompleted = "completed"
 )
 
+// Reserved tag keys. The cm: prefix is owned by the service — written by
+// archive extraction, never by a client — across the whole tag namespace. The
+// api layer rejects it on upload and PATCH, and a replace-mode UpdateMetadata
+// carries the keys across so a client cannot strip them by accident.
+const (
+	ReservedTagPrefix = "cm:"
+	TagArchiveID      = ReservedTagPrefix + "archive_id"    // on an extracted entry: the archive it came from
+	TagArchivePath    = ReservedTagPrefix + "archive_path"  // on an extracted entry: its full path inside the archive
+	TagArchiveIndex   = ReservedTagPrefix + "archive_index" // on an extracted entry: its directory index (names are not unique)
+	TagArchive        = ReservedTagPrefix + "archive"       // on an archive row: TagArchiveMarker once it has been extracted
+)
+
+// TagArchiveMarker is the value of TagArchive. A string, not a boolean, because
+// the list endpoint's tag.<k>=<v> filter is string-typed: this is what makes
+// GET /files?tag.cm:archive=true list the archives.
+const TagArchiveMarker = "true"
+
+// EntryScope selects whether extracted archive entries appear in a List. The
+// parameter is about *entries*, not archives: the archives themselves are
+// found by their TagArchive marker.
+type EntryScope string
+
+const (
+	EntriesInclude EntryScope = "include" // the default: files, archives and entries together
+	EntriesExclude EntryScope = "exclude" // everything but extracted entries
+	EntriesOnly    EntryScope = "only"    // extracted entries alone
+)
+
 // IdempotencyRecord is the stored state of an upload idempotency key.
 type IdempotencyRecord struct {
 	Status string  // IdempotencyPending | IdempotencyCompleted
@@ -48,7 +76,13 @@ type ListFilter struct {
 	ContentType string
 	Tags        map[string]any // matched against the JSONB metadata column
 	Limit       int
-	Cursor      string // exclusive upper-bound file id; empty means first page
+	Cursor      string     // exclusive upper-bound file id; empty means first page
+	Entries     EntryScope // "" behaves as EntriesInclude
+
+	// IncludeDeleted also returns soft-deleted rows. Every read path stays
+	// live-only except extraction's resume logic, which must see the tombstone
+	// of an entry the user deleted so that it does not recreate it.
+	IncludeDeleted bool
 }
 
 // Repository persists File records. Implementations own all SQL.
@@ -64,6 +98,7 @@ type Repository interface {
 
 	// UpdateMetadata writes tags into the record's JSONB metadata: merged into
 	// the existing object when merge is true, replacing it wholesale otherwise.
+	// A replace preserves keys under ReservedTagPrefix.
 	UpdateMetadata(ctx context.Context, id string, tags map[string]any, merge bool) (*File, error)
 
 	// Delete soft-deletes the record by ID (sets deleted_at). The object is

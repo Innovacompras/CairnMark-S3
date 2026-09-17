@@ -21,6 +21,8 @@ type Config struct {
 	Postgres Postgres
 	Storage  Storage
 	GC       GC
+	Archive  Archive
+	Jobs     Jobs
 }
 
 // GC configures the background reconciliation sweep. A non-positive Interval
@@ -67,6 +69,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	archive, err := loadArchive()
+	if err != nil {
+		return Config{}, err
+	}
+	jobs, err := loadJobs()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		HTTPAddr:        getenv("CAIRNMARK_HTTP_ADDR", ":8080"),
 		ShutdownTimeout: 10 * time.Second,
@@ -75,6 +85,8 @@ func Load() (Config, error) {
 			DSN: getenv("CAIRNMARK_POSTGRES_DSN", ""),
 		},
 		Storage: storage,
+		Archive: archive,
+		Jobs:    jobs,
 		GC: GC{
 			Interval:       5 * time.Minute,
 			GracePeriod:    time.Hour,

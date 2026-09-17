@@ -32,3 +32,28 @@ echo
 echo "5) Add a tag, then delete"
 curl -fsS -X PATCH -d '{"reviewed":true}' "$BASE/files/$ID/metadata"; echo
 curl -fsS -o /dev/null -w "   delete -> HTTP %{http_code}\n" -X DELETE "$BASE/files/$ID"
+
+echo
+echo "6) Upload a zip, list what is inside, extract it (a job: submit, then poll), find one extracted entry"
+if command -v zip >/dev/null; then
+  mkdir -p "$TMP/docs"
+  echo "quarterly numbers" > "$TMP/docs/q3.txt"
+  echo '{"ok":true}' > "$TMP/docs/data.json"
+  ( cd "$TMP" && zip -qr docs.zip docs )
+  ARCHIVE=$(curl -fsS -H "Content-Type: application/zip" --data-binary @"$TMP/docs.zip" \
+    "$BASE/files?filename=docs.zip" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  curl -fsS "$BASE/files/$ARCHIVE/archive"; echo
+  JOB=$(curl -fsS -X POST "$BASE/files/$ARCHIVE/extract" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  echo "   -> job=$JOB (202 Accepted; the worker runs it — poll until it is final)"
+  for _ in $(seq 1 60); do
+    STATE=$(curl -fsS "$BASE/jobs/$JOB")
+    case "$STATE" in
+      *'"status":"succeeded"'*|*'"status":"failed"'*|*'"status":"cancelled"'*) break ;;
+    esac
+    sleep 1
+  done
+  echo "$STATE"
+  curl -fsS "$BASE/files?tag.cm:archive_id=$ARCHIVE&tag.cm:archive_path=docs/q3.txt"; echo
+else
+  echo "   (zip is not installed; skipping)"
+fi
